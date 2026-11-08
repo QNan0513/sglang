@@ -24,6 +24,7 @@ from sglang.srt.layers.attention.linear.utils import (
     resolve_linear_attn_backends,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -137,6 +138,41 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
                 self._setup(**setup) as backend,
             ):
                 self.assertEqual(backend.supports_prefill_graph_extend(), captured)
+
+    def test_full_prefill_graphs_take_the_tables_wherever_the_setup_allows(self):
+        """A full prefill graph has no eager break: it runs the extend on the
+        static tables whatever the breakable switch says, for drafts too."""
+        for setup, supported in (
+            ({}, True),
+            (dict(draft=True), True),
+            (dict(cuda=False), False),
+            (dict(enable_mis=True), False),
+        ):
+            with (
+                self.subTest(**setup),
+                envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(False),
+                self._setup(**setup) as backend,
+            ):
+                self.assertEqual(
+                    backend.supports_full_prefill_graph_extend(), supported
+                )
+
+    def test_full_prefill_graph_state_rejects_what_the_tables_cannot_run(self):
+        with self._setup() as backend:
+            backend.prefill_graph_max_seqs = 16
+            backend.init_prefill_cuda_graph_state(max_num_tokens=512, max_req_slots=16)
+            with self.assertRaisesRegex(ValueError, "full_prefill_max_req"):
+                backend.init_prefill_cuda_graph_state(
+                    max_num_tokens=512, max_req_slots=17
+                )
+        with (
+            self._setup(enable_mis=True) as backend,
+            self.assertRaisesRegex(ValueError, "breakable"),
+        ):
+            backend.init_prefill_cuda_graph_state(max_num_tokens=512, max_req_slots=16)
+        # Other platforms keep their own prefill graph handling.
+        with self._setup(cuda=False) as backend:
+            backend.init_prefill_cuda_graph_state(max_num_tokens=512, max_req_slots=16)
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
@@ -286,6 +322,28 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
                 cuda_version="12.9",
             )
         )
+
+    def test_declines_for_full_prefill_cuda_graphs(self):
+        """Full prefill graphs capture the extend on the Triton chain's tables."""
+
+        def full_prefill_graph(phase, backend):
+            return (phase, backend) == (Phase.PREFILL, Backend.FULL)
+
+        for capability, state_dtype in (
+            ((10, 0), torch.bfloat16),
+            ((9, 0), torch.float32),
+        ):
+            with self.subTest(capability=capability):
+                runner = make_runner(self, state_dtype=state_dtype)
+                self.assertEqual(
+                    self.apply_policy(runner, capability=capability), "flashinfer"
+                )
+                with patch.object(
+                    gdn_backend,
+                    "check_cuda_graph_backend",
+                    side_effect=full_prefill_graph,
+                ):
+                    self.assertIsNone(self.apply_policy(runner, capability=capability))
 
     def test_rejects_explicit_flashinfer_prefill_in_deterministic_mode(self):
         """Explicit backend precedence must not bypass deterministic GDN startup."""

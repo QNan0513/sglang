@@ -5,7 +5,9 @@ One bucket is captured once, then replayed for batches of different shapes:
 several sequences, cached prefixes, padding past the batch, chunk-aligned and
 unaligned prefix-cache snapshots, and a batch without tracking. Each replay must
 match the eager path bit for bit on the output, the conv / SSM state pools and
-the track slots, for FP32 and BF16 SSM states.
+the track slots, for FP32 and BF16 SSM states. A full prefill CUDA graph pads
+the request axis with zero-length sentinel slots, both at capture and in its
+replay view; the tables then hold the real requests only.
 """
 
 import unittest
@@ -14,6 +16,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+)
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
     GDNKernelDispatcher,
@@ -141,6 +146,26 @@ def _batch(extend_lens, prefix_lens, track=None):
     return batch
 
 
+def _full_graph_view(batch, slots):
+    """The full prefill runner's replay view of ``batch``: its per-request device
+    tensors padded to ``slots`` with zero-length sentinels, its CPU lengths and
+    track tensors the batch's own."""
+    pad = slots - batch.batch_size
+    view = SimpleNamespace(**vars(batch))
+    view.batch_size = slots
+
+    def padded(t, value=0):
+        return torch.cat([t, t.new_full((pad,), value)])
+
+    view.req_pool_indices = padded(batch.req_pool_indices)
+    view.extend_seq_lens = padded(batch.extend_seq_lens)
+    view.extend_prefix_lens = padded(batch.extend_prefix_lens)
+    view.extend_start_loc = padded(
+        batch.extend_start_loc, sum(batch.extend_seq_lens_cpu)
+    )
+    return view
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestGDNPrefillGraph(CustomTestCase):
     def _setup(self, ssm_dtype):
@@ -183,7 +208,7 @@ class TestGDNPrefillGraph(CustomTestCase):
                 meta.track_dst.data_ptr(),
             )
 
-    def _capture(self):
+    def _capture(self, full_slots=None):
         meta = GDNPrefillGraphMetadata.allocate(
             num_tokens=BUCKET,
             max_seqs_cap=MAX_SEQS,
@@ -191,8 +216,15 @@ class TestGDNPrefillGraph(CustomTestCase):
             cache_index_dtype=torch.int32,
             device=torch.device("cuda"),
         )
-        capture_batch = _batch([BUCKET], [0])
-        self._fill(meta, capture_batch)
+        if full_slots is None:
+            capture_batch = _batch([BUCKET], [0])
+            self._fill(meta, capture_batch)
+        else:
+            # One synthetic request, then the full graph's sentinel slots.
+            capture_batch = _batch([BUCKET] + [0] * (full_slots - 1), [0] * full_slots)
+            self._fill(
+                meta, HybridLinearAttnBackend._full_prefill_linear_batch(capture_batch)
+            )
         snapshot = (self.conv_pool.clone(), self.ssm_pool.clone())
 
         def run():
@@ -213,7 +245,9 @@ class TestGDNPrefillGraph(CustomTestCase):
         self.ssm_pool.copy_(snapshot[1])
         return meta, graph, out
 
-    def _check_replay(self, meta, graph, out, *, lens, prefixes, track, seed):
+    def _check_replay(
+        self, meta, graph, out, *, lens, prefixes, track, seed, full_slots=None
+    ):
         batch = _batch(lens, prefixes, track=track)
         total = sum(batch.extend_seq_lens_cpu)
         g = torch.Generator(device="cuda").manual_seed(seed)
@@ -240,6 +274,10 @@ class TestGDNPrefillGraph(CustomTestCase):
             self.b[:total],
         )
 
+        if full_slots is not None:
+            batch = HybridLinearAttnBackend._full_prefill_linear_batch(
+                _full_graph_view(batch, full_slots)
+            )
         self._fill(meta, batch)
         graph.replay()
         torch.cuda.synchronize()
@@ -265,19 +303,21 @@ class TestGDNPrefillGraph(CustomTestCase):
             ([1], [900], None),
         ]
         for ssm_dtype in (torch.float32, torch.bfloat16):
-            self._setup(ssm_dtype)
-            meta, graph, out = self._capture()
-            for i, (lens, prefixes, track) in enumerate(cases):
-                with self.subTest(ssm_dtype=ssm_dtype, case=i):
-                    self._check_replay(
-                        meta,
-                        graph,
-                        out,
-                        lens=lens,
-                        prefixes=prefixes,
-                        track=track,
-                        seed=100 + i,
-                    )
+            for full_slots in (None, MAX_SEQS):
+                self._setup(ssm_dtype)
+                meta, graph, out = self._capture(full_slots)
+                for i, (lens, prefixes, track) in enumerate(cases):
+                    with self.subTest(ssm_dtype=ssm_dtype, full=full_slots, case=i):
+                        self._check_replay(
+                            meta,
+                            graph,
+                            out,
+                            lens=lens,
+                            prefixes=prefixes,
+                            track=track,
+                            seed=100 + i,
+                            full_slots=full_slots,
+                        )
 
 
 if __name__ == "__main__":

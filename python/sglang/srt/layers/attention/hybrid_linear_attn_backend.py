@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -153,6 +154,11 @@ class MambaAttnBackendBase(AttentionBackend):
     def supports_prefill_graph_extend(self) -> bool:
         """Whether breakable prefill CUDA graphs can capture this backend's
         extend on static per-bucket tables instead of breaking at each layer."""
+        return False
+
+    def supports_full_prefill_graph_extend(self) -> bool:
+        """Whether full prefill CUDA graphs can run this backend's extend on those
+        static tables; a full graph has no eager break to fall back on."""
         return False
 
     def prefill_graph_extend_active(self) -> bool:
@@ -1306,6 +1312,11 @@ class HybridLinearAttnBackend(AttentionBackend):
                 "Breakable prefill CUDA graphs capture the %s extend.",
                 type(linear_attn_backend).__name__,
             )
+        # Full prefill CUDA graphs run the linear extend on the same static tables,
+        # one per captured bucket (keyed by its token count); set up by
+        # init_prefill_cuda_graph_state.
+        self._full_prefill_linear_extend = False
+        self._full_prefill_linear_metadata: dict[int, object] = {}
 
     @property
     def data_type(self):
@@ -1344,10 +1355,74 @@ class HybridLinearAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if self._full_prefill_linear_extend and self._is_plain_extend(forward_batch):
+            self._init_full_prefill_graph_metadata(forward_batch, in_capture=in_capture)
+            return
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
+
+    def _init_full_prefill_graph_metadata(
+        self, forward_batch: ForwardBatch, *, in_capture: bool
+    ):
+        """A full prefill CUDA graph's extend: the full-attention child plans its
+        capture-stable metadata, and the linear extend runs on its bucket's static
+        tables, allocated at capture and refreshed in place before every replay.
+        The decode-shaped replay metadata has no extend path."""
+        self.full_attn_backend.init_forward_metadata_out_graph(
+            forward_batch, in_capture=in_capture
+        )
+        # Capture and replay both hand over the bucket-sized input_ids.
+        bucket = forward_batch.input_ids.shape[0]
+        linear_batch = self._full_prefill_linear_batch(forward_batch)
+        if in_capture:
+            self._full_prefill_linear_metadata[bucket] = (
+                self.linear_attn_backend.init_prefill_graph_metadata(linear_batch)
+            )
+        else:
+            self.linear_attn_backend.refresh_prefill_graph_metadata(
+                self._full_prefill_linear_metadata[bucket], linear_batch
+            )
+
+    @staticmethod
+    def _full_prefill_linear_batch(forward_batch: ForwardBatch) -> ForwardBatch:
+        """The real requests of a full prefill graph batch. The runner pads the
+        request axis with zero-length sentinel slots: after the capture request,
+        and in the device tensors of the replay view, whose CPU lengths are the
+        real batch's. Sentinels own no tokens, chunks or state, and a small
+        bucket's tables have fewer sequence rows than the runner has slots."""
+        lens = list(forward_batch.extend_seq_lens_cpu)
+        bs = len(lens)
+        while bs > 0 and lens[bs - 1] == 0:
+            bs -= 1
+        if bs == forward_batch.batch_size == len(lens):
+            return forward_batch
+        view = copy.copy(forward_batch)
+        view.batch_size = bs
+        for name in (
+            "req_pool_indices",
+            "seq_lens",
+            "extend_seq_lens",
+            "extend_prefix_lens",
+            "extend_start_loc",
+            "mamba_track_mask",
+            "mamba_track_indices",
+            "mamba_track_seqlens",
+        ):
+            value = getattr(view, name, None)
+            if value is not None:
+                setattr(view, name, value[:bs])
+        for name in (
+            "extend_seq_lens_cpu",
+            "extend_prefix_lens_cpu",
+            "mamba_prefill_track_mask_cpu",
+            "mamba_track_seqlens_cpu",
+        ):
+            value = getattr(view, name, None)
+            if value is not None:
+                setattr(view, name, list(value)[:bs])
+        return view
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return SharedReadEnds.max_of(
@@ -1454,6 +1529,23 @@ class HybridLinearAttnBackend(AttentionBackend):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_prefill_cuda_graph_state(
+        self, *, max_num_tokens: int, max_req_slots: int
+    ) -> None:
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_prefill_cuda_graph_state(
+                max_num_tokens=max_num_tokens, max_req_slots=max_req_slots
+            )
+        self._full_prefill_linear_metadata.clear()
+        self._full_prefill_linear_extend = (
+            self.linear_attn_backend.supports_full_prefill_graph_extend()
+        )
+        if self._full_prefill_linear_extend:
+            logger.info(
+                "Full prefill CUDA graphs capture the %s extend on static tables.",
+                type(self.linear_attn_backend).__name__,
+            )
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:

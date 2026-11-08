@@ -45,6 +45,11 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -282,6 +287,9 @@ def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
         get_exec().mamba.linear_attn_prefill_backend is not None
         or get_exec().mamba.linear_attn_backend != "triton"
         or get_exec().deterministic.enable_deterministic_inference
+        # Full prefill CUDA graphs capture the extend on the Triton chain's
+        # static tables (gdn_prefill_graph.py).
+        or check_cuda_graph_backend(Phase.PREFILL, Backend.FULL)
         or sm_major not in (9, 10)
     ):
         return None
@@ -645,12 +653,44 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def supports_prefill_graph_extend(self) -> bool:
         # Read here, not in __init__: the support check reads model_config.
-        return (
+        if not (
             envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.get()
             # drafts keep their eager GDN extend; only the target's is captured
             and not self.is_draft_worker
-            and self._prefill_graph_extend_supported()
+        ):
+            return False
+        supported = self._prefill_graph_extend_supported()
+        rank0_log(
+            "GDN prefill extend inside breakable prefill CUDA graphs: "
+            + ("on" if supported else "unsupported here, layers keep breaking")
         )
+        return supported
+
+    def supports_full_prefill_graph_extend(self) -> bool:
+        # A full prefill graph has no eager break, so the static tables are its
+        # only extend path, whatever SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND says.
+        return self._prefill_graph_extend_supported()
+
+    def init_prefill_cuda_graph_state(
+        self, *, max_num_tokens: int, max_req_slots: int
+    ) -> None:
+        if not is_cuda():
+            return
+        if not self._prefill_graph_extend_supported():
+            raise ValueError(
+                "Full prefill CUDA graphs run the GDN extend on static per-bucket "
+                "tables, which need the Triton GDN prefill kernel "
+                "(--linear-attn-prefill-backend triton), no --enable-mis, a "
+                "contiguous state pool and capture buckets that keep chunk_fwd_o's "
+                "block size. Use --cuda-graph-backend-prefill breakable otherwise."
+            )
+        if max_req_slots > self.prefill_graph_max_seqs:
+            raise ValueError(
+                f"Full prefill CUDA graphs hold {max_req_slots} requests, more than "
+                f"the GDN static tables' {self.prefill_graph_max_seqs} sequences; "
+                "lower cuda_graph_config.prefill.full_prefill_max_req or raise "
+                "SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS."
+            )
 
     def _prefill_graph_extend_supported(self) -> bool:
         from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
@@ -659,7 +699,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         mamba_cache = self.state_pool.mamba_cache
         capture_tokens = get_exec().graph.cuda_graph_config.prefill.bs or []
-        supported = (
+        return (
             is_cuda()
             and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
             and not self.enable_mis
@@ -671,11 +711,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 get_prefill_num_tokens_to_capture(capture_tokens)
             )
         )
-        rank0_log(
-            "GDN prefill extend inside breakable prefill CUDA graphs: "
-            + ("on" if supported else "unsupported here, layers keep breaking")
-        )
-        return supported
 
     def prefill_graph_extend_active(self) -> bool:
         return self.prefill_graph_metadata is not None
