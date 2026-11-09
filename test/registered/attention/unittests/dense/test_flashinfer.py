@@ -1,7 +1,9 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -12,6 +14,9 @@ from sglang.test.kits.attention_unittest.attention_methods.dense_attention impor
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_dense_cuda_graph_decode_case,
+)
+from sglang.test.kits.attention_unittest.runner_modes.full_prefill_cuda_graph_runner import (
+    run_dense_full_prefill_cuda_graph_cases,
 )
 from sglang.test.kits.attention_unittest.runner_modes.speculative_draft_runner import (
     run_dense_eagle_draft_cuda_graph_runner_case,
@@ -96,6 +101,27 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
             ),
             4,
         ),
+    )
+    # Replayed through full prefill graphs of 64 and 32 tokens with 4 request
+    # slots: fresh prompts, cached prefixes, and a mix of both in one batch.
+    FULL_PREFILL_CUDA_GRAPH_CASES = tuple(
+        DenseAttentionCase(
+            name=f"runner_full_prefill_cuda_graph_{name}",
+            backend="flashinfer",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=16,
+            prefix_lens=prefix_lens,
+            extend_lens=extend_lens,
+        )
+        for name, prefix_lens, extend_lens in (
+            ("fresh", (0,), (37,)),
+            ("fresh_small_bucket", (0, 0), (9, 14)),
+            ("mixed_prefixes", (0, 16, 33), (20, 8, 1)),
+            ("all_slots_all_tokens", (40, 7, 0, 64), (16, 16, 16, 16)),
+            ("prefixed_small_bucket", (5, 100), (30, 2)),
+        )
     )
     SPEC_VERIFY_CASES = (
         (
@@ -362,6 +388,32 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
                         head_dim=self.HEAD_DIM,
                         hidden_size=self.HIDDEN_SIZE,
                     )
+
+    def test_runner_mode_full_prefill_cuda_graph_cases(self):
+        # Both EXTEND paths of a full graph: a ragged pass over the new tokens
+        # plus a paged pass over the prefix (taken with an FP8 KV cache, forced
+        # here on this FP16 one), and a single paged pass.
+        for split in (True, False):
+            with (
+                self.subTest(split=split),
+                patch.object(
+                    FlashInferAttnBackend,
+                    "_full_cg_prefill_uses_ragged",
+                    return_value=split,
+                ),
+            ):
+                backend = run_dense_full_prefill_cuda_graph_cases(
+                    self,
+                    self.FULL_PREFILL_CUDA_GRAPH_CASES,
+                    buckets=(64, 32),
+                    req_slots=4,
+                    head_dim=self.HEAD_DIM,
+                    hidden_size=self.HIDDEN_SIZE,
+                    max_context_len=128,
+                )
+                self.assertEqual(
+                    backend.full_cg_prefill_wrapper_ragged is not None, split
+                )
 
     def test_runner_mode_spec_verify_cases(self):
         for case, topk, spec_kind in self.SPEC_VERIFY_CASES:

@@ -176,6 +176,8 @@ class PrefillMetadata:
     multi_item_params: Optional[MultiItemScoringParams] = None
     swa_out_cache_loc: Optional[torch.Tensor] = None
     cp_wrapper: Optional[BatchPrefillWithPagedKVCacheWrapper] = None
+    # A full prefill CUDA graph's own ragged wrapper; None means the backend's.
+    prefill_wrapper_ragged: Optional[BatchPrefillWithRaggedKVCacheWrapper] = None
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -554,6 +556,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             ):
                 fmha_backend = "cutlass"
+        # Read by _full_cg_prefill_uses_ragged.
+        self.prefill_ragged_backend = fmha_backend
 
         # Sliding/full or decoder/cross-attention layers use separate plans.
         self.prefill_wrappers_ragged = []
@@ -618,6 +622,11 @@ class FlashInferAttnBackend(AttentionBackend):
         # Created lazily on first capture in _prepare_cuda_graph_metadata.
         self.full_cg_prefill_wrappers: Optional[
             List[BatchPrefillWithPagedKVCacheWrapper]
+        ] = None
+        # Their ragged counterpart, created with them where the eager EXTEND
+        # splits off the new tokens (see _full_cg_prefill_uses_ragged).
+        self.full_cg_prefill_wrapper_ragged: Optional[
+            BatchPrefillWithRaggedKVCacheWrapper
         ] = None
 
     def prefill_cp_unsupported_reason(self) -> Optional[str]:
@@ -947,6 +956,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # target-verify / draft-extend / dllm branches (also is_extend()).
             # Split-kv must stay on — its block_valid_mask is the only
             # early-exit for the captured fixed grid's padded/stale tiles.
+            # With a ragged wrapper, the paged one plans the cached prefix only.
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -954,9 +964,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_sum,
                 prefix_lens=forward_batch.extend_prefix_lens[:bs],
                 prefill_wrappers=self.full_cg_prefill_wrappers,
-                use_ragged=False,
+                use_ragged=self.full_cg_prefill_wrapper_ragged is not None,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
+                extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
+                prefill_wrapper_ragged=self.full_cg_prefill_wrapper_ragged,
                 plan=forward_batch.iteration_ids,
             )
         else:
@@ -1384,6 +1396,26 @@ class FlashInferAttnBackend(AttentionBackend):
         tmp_s = per_row
         return int((tmp_v + tmp_s) * FULL_CG_PREFILL_WORKSPACE_MARGIN)
 
+    def _full_cg_prefill_uses_ragged(self) -> bool:
+        """Whether a full prefill graph's EXTEND splits like the eager one:
+        the new tokens attend to themselves on a ragged wrapper, to the
+        cached prefix on the paged one, and the two are merged. Only with an
+        FP8 KV cache, where the paged kernel would read the new tokens back in
+        FP8, and only where eager's ragged backend is fa2, the one a graph can
+        re-plan: the graph then computes what eager does. With a 16-bit cache,
+        or against eager's cutlass kernel, the extra pass and merges cost at
+        least what they save. The sliding-window and cross-attention planners
+        keep the paged path."""
+        return (
+            self.flashinfer_kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            and self.prefill_ragged_backend == "fa2"
+            and self.dispatch_reason is None
+            and not (self.is_multimodal or self.enable_mis)
+            and not self.enable_deterministic
+            and not self.use_paged
+            and not self.prefill_uses_dequant_workspace
+        )
+
     def _create_full_cg_prefill_wrappers(
         self, num_slots: int, max_num_tokens: int
     ) -> list:
@@ -1395,7 +1427,8 @@ class FlashInferAttnBackend(AttentionBackend):
         captured bucket. The request-slot count is fixed at capture (the
         runner pads real batches up to it with zero-length sentinel
         requests); kv indices cover up to num_slots sequences of
-        max_context_len.
+        max_context_len. Also sets up full_cg_prefill_wrapper_ragged where
+        _full_cg_prefill_uses_ragged holds.
         """
         device = self.workspace_buffer.device
         self.full_cg_prefill_req_slots = num_slots
@@ -1436,6 +1469,26 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             for _ in range(self.num_wrappers)
         ]
+        if self._full_cg_prefill_uses_ragged():
+            # Shares the workspace: the ragged pass and its split-kv merge end
+            # before the paged pass starts. fa2 re-plans in place; cutlass
+            # allocates new plan buffers per plan() and auto may re-resolve.
+            self.full_cg_prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+                self.full_cg_prefill_workspace_buffer,
+                "NHD",
+                use_cuda_graph=True,
+                backend="fa2",
+                qo_indptr_buf=torch.zeros(
+                    (num_slots + 1,), dtype=torch.int32, device=device
+                ),
+                kv_indptr_buf=torch.zeros(
+                    (num_slots + 1,), dtype=torch.int32, device=device
+                ),
+            )
+            logger.info(
+                "Full prefill CUDA graphs split the FlashInfer extend into "
+                "ragged and paged passes."
+            )
         return [
             BatchPrefillWithPagedKVCacheWrapper(
                 self.full_cg_prefill_workspace_buffer,
@@ -1492,8 +1545,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.full_cg_prefill_wrappers = self._create_full_cg_prefill_wrappers(
                     bs, num_tokens
                 )
+            # The graph runs the ragged pass, the paged pass and the merge for
+            # every replay: whether a batch has a prefix is not known here.
             self.forward_metadata = PrefillMetadata(
-                self.full_cg_prefill_wrappers, False, False
+                self.full_cg_prefill_wrappers,
+                self.full_cg_prefill_wrapper_ragged is not None,
+                False,
+                prefill_wrapper_ragged=self.full_cg_prefill_wrapper_ragged,
             )
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
@@ -1633,7 +1691,10 @@ class FlashInferAttnBackend(AttentionBackend):
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
-            prefill_wrapper_ragged = self.prefill_wrappers_ragged[wrapper_idx]
+            prefill_wrapper_ragged = (
+                self.forward_metadata.prefill_wrapper_ragged
+                or self.prefill_wrappers_ragged[wrapper_idx]
+            )
             if self.forward_metadata.extend_no_prefix:
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
@@ -2123,6 +2184,7 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        prefill_wrapper_ragged: Optional[BatchPrefillWithRaggedKVCacheWrapper] = None,
         *,
         plan: IterationIds,
     ):
@@ -2145,6 +2207,7 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        prefill_wrapper_ragged: Optional[BatchPrefillWithRaggedKVCacheWrapper] = None,
         *,
         plan: IterationIds,
     ):
@@ -2161,7 +2224,7 @@ class FlashInferIndicesUpdaterPrefill:
             paged_kernel_lens_sum = seq_lens_sum
 
         self.call_begin_forward(
-            self.prefill_wrappers_ragged[0],
+            prefill_wrapper_ragged or self.prefill_wrappers_ragged[0],
             prefill_wrappers[0],
             req_pool_indices,
             paged_kernel_lens,
@@ -2196,12 +2259,18 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        prefill_wrapper_ragged: Optional[BatchPrefillWithRaggedKVCacheWrapper] = None,
         *,
         plan: IterationIds,
     ):
         if custom_kv_indices is not None:
             raise RuntimeError(
                 "NVFP4 custom KV indices are only supported by the single-wrapper FlashInfer path."
+            )
+        if prefill_wrapper_ragged is not None:
+            raise RuntimeError(
+                "A full prefill graph's ragged wrapper is only supported by the "
+                "single-wrapper FlashInfer path."
             )
         if prefix_lens is None:
             num_accept_tokens = getattr(spec_info, "num_accept_tokens", None)
@@ -2344,12 +2413,18 @@ class FlashInferIndicesUpdaterPrefill:
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        prefill_wrapper_ragged: Optional[BatchPrefillWithRaggedKVCacheWrapper] = None,
         *,
         plan: IterationIds,
     ):
         if custom_kv_indices is not None:
             raise RuntimeError(
                 "NVFP4 custom KV indices are not supported for cross-attention."
+            )
+        if prefill_wrapper_ragged is not None:
+            raise RuntimeError(
+                "A full prefill graph's ragged wrapper is not supported for "
+                "cross-attention."
             )
         for wrapper_id in range(2):
             if wrapper_id == 0:
