@@ -650,6 +650,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.prefill_graph_max_seqs = min(
             self.req_to_token_pool.size, envs.SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS.get()
         )
+        # A full prefill graph never replays more requests than its slots;
+        # init_prefill_cuda_graph_state sizes its tables by them.
+        self._full_prefill_graph_max_seqs: Optional[int] = None
 
     def supports_prefill_graph_extend(self) -> bool:
         # Read here, not in __init__: the support check reads model_config.
@@ -691,6 +694,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 "lower cuda_graph_config.prefill.full_prefill_max_req or raise "
                 "SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS."
             )
+        # The chunk and conv grids carry a spare row per sequence they can hold:
+        # at the 16384-token bucket, 32 slots give 288 chunk rows, 128 give 384.
+        self._full_prefill_graph_max_seqs = max_req_slots
 
     def _prefill_graph_extend_supported(self) -> bool:
         from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
@@ -721,7 +727,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices = self._prefill_graph_cache_indices(forward_batch)
         meta = GDNPrefillGraphMetadata.allocate(
             num_tokens=forward_batch.positions.shape[0],
-            max_seqs_cap=self.prefill_graph_max_seqs,
+            max_seqs_cap=self._full_prefill_graph_max_seqs
+            or self.prefill_graph_max_seqs,
             # Any replay of this bucket may carry prefix-cache snapshots (the
             # extra buffer is only on with the radix cache).
             track=get_exec().mamba.enable_mamba_extra_buffer,

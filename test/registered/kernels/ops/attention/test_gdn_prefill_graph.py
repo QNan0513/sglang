@@ -7,7 +7,8 @@ unaligned prefix-cache snapshots, and a batch without tracking. Each replay must
 match the eager path bit for bit on the output, the conv / SSM state pools and
 the track slots, for FP32 and BF16 SSM states. A full prefill CUDA graph pads
 the request axis with zero-length sentinel slots, both at capture and in its
-replay view; the tables then hold the real requests only.
+replay view; the tables then hold the real requests only, in as many sequence
+rows as the graph has slots.
 """
 
 import unittest
@@ -39,6 +40,8 @@ register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-s
 HEADS, V_HEADS, HEAD_DIM, CONV = 2, 4, 128, 4
 DIM = (2 * HEADS + V_HEADS) * HEAD_DIM
 BUCKET, MAX_SEQS = 512, 16
+# Request slots of the full prefill graphs under test.
+FULL_SLOTS = (MAX_SEQS, 4)
 NUM_SLOTS = 48
 CHUNK = 64
 
@@ -211,7 +214,7 @@ class TestGDNPrefillGraph(CustomTestCase):
     def _capture(self, full_slots=None):
         meta = GDNPrefillGraphMetadata.allocate(
             num_tokens=BUCKET,
-            max_seqs_cap=MAX_SEQS,
+            max_seqs_cap=full_slots or MAX_SEQS,
             track=True,
             cache_index_dtype=torch.int32,
             device=torch.device("cuda"),
@@ -303,10 +306,12 @@ class TestGDNPrefillGraph(CustomTestCase):
             ([1], [900], None),
         ]
         for ssm_dtype in (torch.float32, torch.bfloat16):
-            for full_slots in (None, MAX_SEQS):
+            for full_slots in (None, *FULL_SLOTS):
                 self._setup(ssm_dtype)
                 meta, graph, out = self._capture(full_slots)
                 for i, (lens, prefixes, track) in enumerate(cases):
+                    if full_slots is not None and len(lens) > full_slots:
+                        continue  # the runner replays no graph for this batch
                     with self.subTest(ssm_dtype=ssm_dtype, full=full_slots, case=i):
                         self._check_replay(
                             meta,

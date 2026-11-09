@@ -111,7 +111,12 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
                 gdn_backend, "buckets_keep_chunk_o_block_size", return_value=True
             ),
             patch.object(
-                gdn_backend, "get_exec", return_value=SimpleNamespace(graph=graph)
+                gdn_backend,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    graph=graph,
+                    mamba=SimpleNamespace(enable_mamba_extra_buffer=False),
+                ),
             ),
             patch(
                 "sglang.srt.model_executor.runner.prefill_cuda_graph_runner."
@@ -173,6 +178,31 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
         # Other platforms keep their own prefill graph handling.
         with self._setup(cuda=False) as backend:
             backend.init_prefill_cuda_graph_state(max_num_tokens=512, max_req_slots=16)
+
+    def test_full_prefill_graph_tables_hold_its_request_slots(self):
+        """The chunk and conv tables carry a spare row per sequence they can hold.
+        A breakable graph's batch may hold up to the env cap, a full graph's only
+        its request slots, so its tables are that much smaller."""
+        batch = SimpleNamespace(positions=torch.zeros(16384, dtype=torch.int64))
+        with (
+            self._setup() as backend,
+            patch.object(
+                backend,
+                "_prefill_graph_cache_indices",
+                return_value=torch.zeros(1, dtype=torch.int32),
+            ),
+            patch.object(backend, "_fill_prefill_graph_metadata"),
+        ):
+            backend.device = torch.device("cpu")
+            backend.prefill_graph_max_seqs = 128
+            backend._full_prefill_graph_max_seqs = None
+            breakable = backend.init_prefill_graph_metadata(batch)
+            backend.init_prefill_cuda_graph_state(
+                max_num_tokens=16384, max_req_slots=32
+            )
+            full = backend.init_prefill_graph_metadata(batch)
+        self.assertEqual((breakable.max_seqs, breakable.max_chunks), (128, 384))
+        self.assertEqual((full.max_seqs, full.max_chunks), (32, 288))
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
